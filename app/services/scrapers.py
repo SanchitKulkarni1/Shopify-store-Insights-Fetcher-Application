@@ -284,12 +284,12 @@ async def fetch_brand_context(website_url: str) -> BrandContext:
                         break
                 except Exception:
                     continue
-        awaitables = [
-            fill_policy("privacy_policy_url", ["/policies/privacy-policy"]),
-            fill_policy("refund_policy_url",  ["/policies/refund-policy"]),
-            fill_policy("terms_url",          ["/policies/terms-of-service"]),
-            fill_policy("shipping_policy_url",["/policies/shipping-policy"]),
-        ]
+
+        await fill_policy("privacy_policy_url", ["/policies/privacy-policy"]),
+        await fill_policy("refund_policy_url",  ["/policies/refund-policy"]),
+        await fill_policy("terms_url",          ["/policies/terms-of-service"]),
+        await fill_policy("shipping_policy_url",["/policies/shipping-policy"]),
+
         # These are regular coroutines but awaited sequentially above (keep simple)
 
         return BrandContext(
