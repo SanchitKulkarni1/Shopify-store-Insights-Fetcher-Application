@@ -1,48 +1,67 @@
 from typing import List, Dict, Optional
-from urllib.parse import urlparse
 import httpx
 from bs4 import Tag
-from app.models import BrandContext, Product, FAQ, Policies, SocialHandles, ContactDetails, ImportantLinks
+from app.models import (
+    BrandContext, Product, FAQ, Policies,
+    SocialHandles, ContactDetails, ImportantLinks
+)
+
+from .helpers import get_universal_price, get_universal_currency
 from .helpers import (
     norm_base, fetch_text, fetch_json, soup, is_shopify_html, absolute,
     EMAIL_RE, PHONE_RE
 )
 
-# ---------- Product catalog via /products.json (with pagination attempts) ----------
+# ---------- Product catalog with PAGINATION ----------
 async def get_products(client: httpx.AsyncClient, base: str) -> List[Product]:
     products: List[Product] = []
-
-    # Try common endpoints/pagination patterns
+    
+    # We will use one of these URLs as a template
     candidate_urls = [
         f"{base}/products.json?limit=250",
         f"{base}/collections/all/products.json?limit=250",
     ]
 
-    for url in candidate_urls:
-        try:
-            data = await fetch_json(client, url)
-            items = data.get("products") or data.get("items") or []
-            for p in items:
-                variants = p.get("variants", [])
-                price = variants[0].get("price") if variants else None
-                currency = variants[0].get("currency") or p.get("currency") if variants else None
-                images = p.get("images") or []
-                image = (images[0].get("src") if images else None) or (p.get("image") or {}).get("src")
-                handle = p.get("handle")
-                prod_url = f"{base}/products/{handle}" if handle else None
-                products.append(Product(
-                    title=p.get("title") or "",
-                    handle=handle,
-                    url=prod_url,
-                    price=str(price) if price is not None else None,
-                    currency=currency,
-                    image=image,
-                    tags=p.get("tags", [])
-                ))
-        except Exception:
-            continue
+    for url_template in candidate_urls:
+        page = 1
+        while True:  # Loop until we run out of pages
+            try:
+                paginated_url = f"{url_template}&page={page}"
+                data = await fetch_json(client, paginated_url)
+                items = data.get("products") or data.get("items") or []
 
-    # De-duplicate by handle/title
+                if not items:
+                    # If we get an empty list, it's the last page.
+                    break 
+
+                for p in items:
+                    # Your original, robust data extraction logic is great here!
+                    variants = p.get("variants", [])
+                    price = (variants[0].get("price") or variants[0].get("cost") or variants[0].get("amount") or variants[0].get("value")) if variants else None
+                    currency = variants[0].get("currency") or p.get("currency") if variants else None
+                    images = p.get("images") or []
+                    raw_img = (images[0].get("src") if images else None) or (p.get("image") or {}).get("src")
+                    image = absolute(base, raw_img) if raw_img else None
+                    handle = p.get("handle")
+                    prod_url = absolute(base, f"/products/{handle}") if handle else None
+
+                    products.append(Product(
+                        title=p.get("title") or "", handle=handle, url=prod_url,
+                        price=str(price) if price is not None else None,
+                        currency=currency, image=image, tags=p.get("tags", [])
+                    ))
+                
+                page += 1 # Increment to get the next page
+            
+            except Exception:
+                # If any page fails, just stop trying for that URL template
+                break
+        
+        # If we successfully got products from the first candidate URL, we don't need to try the second.
+        if products:
+            break
+
+    # De-duplicate by handle/title (your original logic is perfect)
     seen = set()
     deduped = []
     for p in products:
@@ -55,30 +74,40 @@ async def get_products(client: httpx.AsyncClient, base: str) -> List[Product]:
 # ---------- Hero products from homepage ----------
 def extract_hero_products(home_soup, base: str) -> List[Product]:
     heroes: List[Product] = []
-    # Strategy: any anchor linking to /products/... with visible card-like context
-    for a in home_soup.select('a[href*="/products/"]'):
-        href = absolute(base, a.get("href"))
-        title = (a.get("title") or a.get_text(strip=True)) or None
-        # Climb up to find image and price in nearby nodes
-        card: Optional[Tag] = a
-        for _ in range(3):
-            if card.parent: card = card.parent
+    # Find all product cards instead of just links for a more stable context
+    for card in home_soup.select('[class*="product-card"], [class*="product-item"]'):
+        link_el = card.select_one('a[href*="/products/"]')
+        if not link_el:
+            continue
+            
+        href = absolute(base, link_el.get("href"))
+        title = (link_el.get("title") or link_el.get_text(strip=True)) or "Hero product"
+
+        # Use the universal helper to find the price within the card
+        price = get_universal_price(card) 
+        currency = get_universal_currency(card)
         img = card.select_one("img")
-        price_el = card.select_one(".price, .product-price, [data-price], .money")
-        price = price_el.get_text(strip=True) if price_el else None
-        image = img.get("src") if img else None
+        raw_img = img.get("src") if img else None
+        image = absolute(base, raw_img) if raw_img else None
+
         if href and "/products/" in href:
-            heroes.append(Product(title=title or "Hero product", url=href, image=image, price=price))
+            heroes.append(Product(
+                title=title,
+                url=href,
+                image=image,
+                price=price,
+                currency=currency
+            ))
+
     # Deduplicate by URL
     uniq = {}
     for h in heroes:
         if h.url and h.url not in uniq:
             uniq[h.url] = h
-    return list(uniq.values())[:12]  # don’t spam
+    return list(uniq.values())[:12]
 
 # ---------- Policies ----------
 def find_policy_links(home_soup, base: str) -> Policies:
-    # Common Shopify routes
     candidates = {
         "privacy_policy_url": ["/policies/privacy-policy", "/pages/privacy-policy", "/privacy-policy", "/policies/privacy"],
         "refund_policy_url": ["/policies/refund-policy", "/pages/refund-policy", "/refund-policy", "/policies/refunds"],
@@ -95,13 +124,14 @@ def find_policy_links(home_soup, base: str) -> Policies:
                 found[key] = absolute(base, link.get("href"))
                 break
 
-    # 2) Fallback: search footer anchors by text
+    # 2) Fallback: footer text search
     footer = home_soup.find("footer")
     anchor_scope = footer or home_soup
     for a in anchor_scope.find_all("a"):
         text = (a.get_text() or "").strip().lower()
         href = absolute(base, a.get("href"))
-        if not href: continue
+        if not href: 
+            continue
         if "privacy" in text and "privacy_policy_url" not in found:
             found["privacy_policy_url"] = href
         if ("refund" in text or "returns" in text) and "refund_policy_url" not in found:
@@ -116,7 +146,8 @@ def find_policy_links(home_soup, base: str) -> Policies:
 # ---------- FAQs ----------
 def extract_faqs(doc, base: str) -> List[FAQ]:
     faqs: List[FAQ] = []
-    # Details/summary pattern
+
+    # <details><summary>
     for d in doc.select("details"):
         q = d.find("summary")
         a = d.find("div") or d.find("p")
@@ -125,11 +156,10 @@ def extract_faqs(doc, base: str) -> List[FAQ]:
         if qtxt and atxt:
             faqs.append(FAQ(question=qtxt, answer=atxt))
 
-    # Heading + paragraph pattern
+    # Heading + paragraphs
     headings = doc.select("h1, h2, h3, h4")
     for h in headings:
         q = h.get_text(" ", strip=True)
-        # next siblings until next heading
         cur = h.next_sibling
         answer_chunks = []
         while cur and getattr(cur, "name", None) not in {"h1","h2","h3","h4"}:
@@ -140,7 +170,7 @@ def extract_faqs(doc, base: str) -> List[FAQ]:
         if q and atxt:
             faqs.append(FAQ(question=q, answer=atxt))
 
-    # Dedup by (question,answer)
+    # Dedup
     uniq = set()
     cleaned = []
     for f in faqs:
@@ -154,7 +184,7 @@ def extract_faqs(doc, base: str) -> List[FAQ]:
 def extract_socials(doc, base: str) -> SocialHandles:
     sh = {}
     for a in doc.find_all("a", href=True):
-        href = a["href"]
+        href = absolute(base, a["href"])
         low = href.lower()
         if "instagram.com" in low and "instagram" not in sh: sh["instagram"] = href
         elif ("facebook.com" in low or "fb.me/" in low) and "facebook" not in sh: sh["facebook"] = href
@@ -165,11 +195,8 @@ def extract_socials(doc, base: str) -> SocialHandles:
             if "youtube" not in sh: sh["youtube"] = href
         elif "linkedin.com" in low and "linkedin" not in sh: sh["linkedin"] = href
         elif "pinterest.com" in low and "pinterest" not in sh: sh["pinterest"] = href
-    # capture any other social-like domains
+
     others = {}
-    known = {"instagram","facebook","tiktok","twitter","youtube","linkedin","pinterest"}
-    for k,v in list(sh.items()):
-        pass
     return SocialHandles(**sh, others=others)
 
 # ---------- Contacts ----------
@@ -187,11 +214,11 @@ def find_about_and_links(home_soup, base: str):
     for a in scope.find_all("a", href=True):
         txt = (a.get_text() or "").strip().lower()
         href = absolute(base, a["href"])
-        if not href: continue
+        if not href:
+            continue
         if not about_text and ("about" in txt or "our story" in txt):
             try:
-                # fetch page to get actual text
-                # defer to caller; they have httpx client
+                # defer actual fetching to caller
                 pass
             except Exception:
                 pass
@@ -211,12 +238,12 @@ async def fetch_brand_context(website_url: str) -> BrandContext:
         try:
             home_html = await fetch_text(client, base)
         except Exception:
-            # Not reachable => treated as 401 at controller level
             return BrandContext(is_shopify=False, base_url=base)
 
         doc = soup(home_html)
         is_shopify = is_shopify_html(home_html)
-        # Brand name from title/og tags
+
+        # Brand name
         brand_name = None
         title = doc.find("title")
         if title: brand_name = title.get_text(strip=True)
@@ -232,14 +259,13 @@ async def fetch_brand_context(website_url: str) -> BrandContext:
         # Policies
         policies = find_policy_links(doc, base)
 
-        # FAQ page(s): try common urls or footer/nav links containing 'faq'
+        # FAQs
         faqs: List[FAQ] = []
         faq_pages = set()
         for a in doc.find_all("a", href=True):
             href = a["href"].lower()
             if "faq" in href or "faqs" in href or "/pages/help" in href or "/pages/support" in href:
                 faq_pages.add(absolute(base, a["href"]))
-        # direct candidates
         faq_pages.update([f"{base}/pages/faq", f"{base}/pages/faqs", f"{base}/apps/faq"])
         for page in list(faq_pages)[:5]:
             try:
@@ -247,7 +273,6 @@ async def fetch_brand_context(website_url: str) -> BrandContext:
                 faqs.extend(extract_faqs(soup(html), base))
             except Exception:
                 continue
-        # dedup faqs
         seen = set()
         faqs_clean = []
         for f in faqs:
@@ -260,22 +285,22 @@ async def fetch_brand_context(website_url: str) -> BrandContext:
         social_handles = extract_socials(doc, base)
         contact_details = extract_contacts(doc)
 
-        # About + important links (and fetch about text if found)
+        # About & links
         about_text, important_links = find_about_and_links(doc, base)
         if about_text is None:
-            # try some common about routes
             for path in ["/pages/about", "/pages/about-us", "/about-us", "/about", "/pages/our-story"]:
                 try:
                     html = await fetch_text(client, f"{base}{path}")
-                    about_text = soup(html).get_text(" ", strip=True)[:2000]  # cap
+                    about_text = soup(html).get_text(" ", strip=True)[:2000]
                     if about_text and len(about_text) > 60:
                         break
                 except Exception:
                     continue
 
-        # If we didn’t find policies via links, try direct fetch to see if they exist
+        # Policies fallback
         async def fill_policy(url_attr, candidates):
-            if getattr(policies, url_attr, None): return
+            if getattr(policies, url_attr, None):
+                return
             for p in candidates:
                 try:
                     html = await fetch_text(client, f"{base}{p}")
@@ -285,12 +310,10 @@ async def fetch_brand_context(website_url: str) -> BrandContext:
                 except Exception:
                     continue
 
-        await fill_policy("privacy_policy_url", ["/policies/privacy-policy"]),
-        await fill_policy("refund_policy_url",  ["/policies/refund-policy"]),
-        await fill_policy("terms_url",          ["/policies/terms-of-service"]),
-        await fill_policy("shipping_policy_url",["/policies/shipping-policy"]),
-
-        # These are regular coroutines but awaited sequentially above (keep simple)
+        await fill_policy("privacy_policy_url", ["/policies/privacy-policy"])
+        await fill_policy("refund_policy_url",  ["/policies/refund-policy"])
+        await fill_policy("terms_url",          ["/policies/terms-of-service"])
+        await fill_policy("shipping_policy_url",["/policies/shipping-policy"])
 
         return BrandContext(
             is_shopify=is_shopify,
