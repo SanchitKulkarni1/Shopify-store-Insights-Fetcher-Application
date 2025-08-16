@@ -16,7 +16,6 @@ from .helpers import (
 async def get_products(client: httpx.AsyncClient, base: str) -> List[Product]:
     products: List[Product] = []
     
-    # We will use one of these URLs as a template
     candidate_urls = [
         f"{base}/products.json?limit=250",
         f"{base}/collections/all/products.json?limit=250",
@@ -24,18 +23,16 @@ async def get_products(client: httpx.AsyncClient, base: str) -> List[Product]:
 
     for url_template in candidate_urls:
         page = 1
-        while True:  # Loop until we run out of pages
+        while True:
             try:
                 paginated_url = f"{url_template}&page={page}"
                 data = await fetch_json(client, paginated_url)
                 items = data.get("products") or data.get("items") or []
 
                 if not items:
-                    # If we get an empty list, it's the last page.
                     break 
 
                 for p in items:
-                    # Your original, robust data extraction logic is great here!
                     variants = p.get("variants", [])
                     price = (variants[0].get("price") or variants[0].get("cost") or variants[0].get("amount") or variants[0].get("value")) if variants else None
                     currency = variants[0].get("currency") or p.get("currency") if variants else None
@@ -51,17 +48,14 @@ async def get_products(client: httpx.AsyncClient, base: str) -> List[Product]:
                         currency=currency, image=image, tags=p.get("tags", [])
                     ))
                 
-                page += 1 # Increment to get the next page
+                page += 1
             
             except Exception:
-                # If any page fails, just stop trying for that URL template
                 break
         
-        # If we successfully got products from the first candidate URL, we don't need to try the second.
         if products:
             break
 
-    # De-duplicate by handle/title (your original logic is perfect)
     seen = set()
     deduped = []
     for p in products:
@@ -74,7 +68,6 @@ async def get_products(client: httpx.AsyncClient, base: str) -> List[Product]:
 # ---------- Hero products from homepage ----------
 def extract_hero_products(home_soup, base: str) -> List[Product]:
     heroes: List[Product] = []
-    # Find all product cards instead of just links for a more stable context
     for card in home_soup.select('[class*="product-card"], [class*="product-item"]'):
         link_el = card.select_one('a[href*="/products/"]')
         if not link_el:
@@ -83,7 +76,6 @@ def extract_hero_products(home_soup, base: str) -> List[Product]:
         href = absolute(base, link_el.get("href"))
         title = (link_el.get("title") or link_el.get_text(strip=True)) or "Hero product"
 
-        # Use the universal helper to find the price within the card
         price = get_universal_price(card) 
         currency = get_universal_currency(card)
         img = card.select_one("img")
@@ -99,7 +91,6 @@ def extract_hero_products(home_soup, base: str) -> List[Product]:
                 currency=currency
             ))
 
-    # Deduplicate by URL
     uniq = {}
     for h in heroes:
         if h.url and h.url not in uniq:
@@ -116,7 +107,6 @@ def find_policy_links(home_soup, base: str) -> Policies:
     }
     found = {}
 
-    # 1) Direct candidates
     for key, paths in candidates.items():
         for p in paths:
             link = home_soup.select_one(f'a[href$="{p}"], a[href*="{p}"]')
@@ -124,7 +114,6 @@ def find_policy_links(home_soup, base: str) -> Policies:
                 found[key] = absolute(base, link.get("href"))
                 break
 
-    # 2) Fallback: footer text search
     footer = home_soup.find("footer")
     anchor_scope = footer or home_soup
     for a in anchor_scope.find_all("a"):
@@ -147,7 +136,6 @@ def find_policy_links(home_soup, base: str) -> Policies:
 def extract_faqs(doc, base: str) -> List[FAQ]:
     faqs: List[FAQ] = []
 
-    # <details><summary>
     for d in doc.select("details"):
         q = d.find("summary")
         a = d.find("div") or d.find("p")
@@ -156,7 +144,6 @@ def extract_faqs(doc, base: str) -> List[FAQ]:
         if qtxt and atxt:
             faqs.append(FAQ(question=qtxt, answer=atxt))
 
-    # Heading + paragraphs
     headings = doc.select("h1, h2, h3, h4")
     for h in headings:
         q = h.get_text(" ", strip=True)
@@ -170,7 +157,6 @@ def extract_faqs(doc, base: str) -> List[FAQ]:
         if q and atxt:
             faqs.append(FAQ(question=q, answer=atxt))
 
-    # Dedup
     uniq = set()
     cleaned = []
     for f in faqs:
@@ -210,25 +196,27 @@ def extract_contacts(doc) -> ContactDetails:
 def find_about_and_links(home_soup, base: str):
     about_text = None
     imp = {}
+    about_page_url = None # Variable to store the about page URL
+
     scope = home_soup.find("footer") or home_soup
     for a in scope.find_all("a", href=True):
         txt = (a.get_text() or "").strip().lower()
-        href = absolute(base, a["href"])
+        href = absolute(base, a.get("href"))
         if not href:
             continue
-        if not about_text and ("about" in txt or "our story" in txt):
-            try:
-                # defer actual fetching to caller
-                pass
-            except Exception:
-                pass
+        
+        # Find the URL for the about page but don't fetch it yet
+        if not about_page_url and ("about" in txt or "our story" in txt):
+            about_page_url = href
+
         if ("track" in txt or "order tracking" in txt or "track order" in txt) and "order_tracking" not in imp:
             imp["order_tracking"] = href
         if ("contact" in txt) and "contact_us" not in imp:
             imp["contact_us"] = href
         if ("blog" in txt or "/blogs" in href) and "blog" not in imp:
             imp["blog"] = href
-    return about_text, ImportantLinks(**imp)
+            
+    return about_page_url, ImportantLinks(**imp)
 
 # ---------- Main orchestrator ----------
 async def fetch_brand_context(website_url: str) -> BrandContext:
@@ -263,16 +251,22 @@ async def fetch_brand_context(website_url: str) -> BrandContext:
         faqs: List[FAQ] = []
         faq_pages = set()
         for a in doc.find_all("a", href=True):
+            link_text = a.get_text(strip=True).lower()
             href = a["href"].lower()
+            if "faq" in link_text or "frequently asked questions" in link_text:
+                faq_pages.add(absolute(base, a["href"]))
+                continue
             if "faq" in href or "faqs" in href or "/pages/help" in href or "/pages/support" in href:
                 faq_pages.add(absolute(base, a["href"]))
         faq_pages.update([f"{base}/pages/faq", f"{base}/pages/faqs", f"{base}/apps/faq"])
+
         for page in list(faq_pages)[:5]:
             try:
                 html = await fetch_text(client, page)
                 faqs.extend(extract_faqs(soup(html), base))
             except Exception:
                 continue
+        
         seen = set()
         faqs_clean = []
         for f in faqs:
@@ -286,8 +280,18 @@ async def fetch_brand_context(website_url: str) -> BrandContext:
         contact_details = extract_contacts(doc)
 
         # About & links
-        about_text, important_links = find_about_and_links(doc, base)
-        if about_text is None:
+        about_page_url, important_links = find_about_and_links(doc, base)
+        about_text = None
+        
+        # Fetch About Us text from the found URL or fallback URLs
+        if about_page_url:
+            try:
+                html = await fetch_text(client, about_page_url)
+                about_text = soup(html).get_text(" ", strip=True)[:2000]
+            except Exception:
+                pass # Ignore if fetching fails
+
+        if not about_text or len(about_text) <= 60:
             for path in ["/pages/about", "/pages/about-us", "/about-us", "/about", "/pages/our-story"]:
                 try:
                     html = await fetch_text(client, f"{base}{path}")
